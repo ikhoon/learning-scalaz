@@ -1,13 +1,15 @@
 import CharToy.{CharBell, CharDone, CharOutput}
 
-import scala.language.higherKinds
+import scala.language.{higherKinds, reflectiveCalls}
 import scalaz._
+import _root_.Free.{Gosub, Return}
+
 import Scalaz._
 /**
   * Created by ikhoon on 2016. 9. 24..
   */
 
-// learing scalaz - Free Monad
+// learning scalaz - Free Monad
 // reference : http://eed3si9n.com/learning-scalaz/Free+Monad.html
 
 // Toy
@@ -61,15 +63,48 @@ object FixE {
 
   // We only use this if Toy b is functor
   // Let's define functor for CharToy
+  // Functor로 만드는 이유는 map을 통해서 recursive하게 수행하기 위해서 인거 같다.
   implicit val charToyInstance = new Functor[CharToy] {
-    override def map[A, B](fa: CharToy[A])(f: (A) => B): CharToy[B] = {
+    override def map[A, B](fa: CharToy[A])(f: A => B): CharToy[B] =
       fa match {
         case CharOutput(b, next) => CharOutput(b, f(next))
         case CharBell(next) => CharBell(f(next))
         case CharDone() => CharDone()
       }
-    }
   }
+}
+
+// Free Monad Part 1
+// WFMM: our FixE already exists, too, and it's called the Free Monad.
+
+sealed abstract class Free[S[+_], +A](implicit S: Functor[S]) {
+  final def map[B](f: A => B): Free[S, B] = flatMap(a => Return(f(a)))
+
+  // flatMap의 구현이 이해가 잘되지 않는다.
+  final def flatMap[B](f: A => Free[S, B]): Free[S, B] = this match {
+    case Gosub(a, g) => Gosub(a, (x: Any) => Gosub(g(x), f))
+    case a => Gosub(a, f)
+  }
+
+}
+
+object Free extends FreeInstances {
+  // Return from the computation with the given value.
+  case class Return[S[+_], +A](a: A) extends Free[S, A]
+  // Suspend the computation with the given suspension.
+  case class Suspend[S[+_], +A](s: S[Free[S, A]]) extends Free[S, A]
+  // Call a subroutine and continue with the given function.
+  case class Gosub[S[+_], +A, +B](a: Free[S, A], f: A => Free[S, B]) extends Free[S, B]
+
+}
+
+trait FreeInstances {
+  implicit def freeMonad[S[+_]: Functor]: Monad[({type l[x] = Free[S, x]})#l] =
+    new Monad[({type l[x] = Free[S, x]})#l] {
+      override def bind[A, B](fa: Free[S, A])(f: A => Free[S, B]): Free[S, B] = fa flatMap f
+      override def map[A, B](fa: Free[S, A])(f: A => B): Free[S, B] = fa.map(f)
+      override def point[A](a: => A): Free[S, A] = Return(a)
+    }
 }
 
 
