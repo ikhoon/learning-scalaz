@@ -40,6 +40,18 @@ class FreeMonadSpec extends WordSpec with Matchers {
       println(program)
 
     }
+
+    "free" in {
+      import LiftFCharToy._
+      val subroutine = output('A')
+      val program = for {
+        _ <- subroutine
+        _ <- bell
+        _ <- done
+      } yield ()
+
+
+    }
   }
 
 

@@ -1,10 +1,12 @@
 import CharToy.{CharBell, CharDone, CharOutput}
 
 import scala.language.{higherKinds, reflectiveCalls}
-import scalaz._
-import _root_.Free.{Gosub, Return}
+import Free.{Gosub, Return, Suspend}
 
+import scalaz.{Functor, Monad}
+import scalaz._
 import Scalaz._
+import scala.annotation.tailrec
 /**
   * Created by ikhoon on 2016. 9. 24..
   */
@@ -77,24 +79,43 @@ object FixE {
 // Free Monad Part 1
 // WFMM: our FixE already exists, too, and it's called the Free Monad.
 
+
 sealed abstract class Free[S[+_], +A](implicit S: Functor[S]) {
   final def map[B](f: A => B): Free[S, B] = flatMap(a => Return(f(a)))
 
-  // flatMap의 구현이 이해가 잘되지 않는다.
+        // flatMap의 구현이 이해가 잘되지 않는다.
+  // 함수를 받으면 새로운 함수를 만든다. 새로 생긴 Gosub에는 x를 인자로 받으면 이를 g에 적용한다.
+  // flatMap을 하면 새로운 f가 마지막 꼬리로 드러간다!!
+
+  // 위의 catchy와 같은 모양이다 Fix에서 xx는 g(x)를 뜻한다
+  // 역시나 쉽지 않다.
   final def flatMap[B](f: A => Free[S, B]): Free[S, B] = this match {
     case Gosub(a, g) => Gosub(a, (x: Any) => Gosub(g(x), f))
     case a => Gosub(a, f)
+  }
+
+  // Scalaz librar에서 복붙
+  /** Evaluates a single layer of the free monad **/
+  @tailrec final def resume(): (S[Free[S,A]] \/ A) =
+  this match {
+    case Return(a) => \/-(a)
+//    case Suspend(t) => -\/(S.map(t)(Return(_)))
+    case b @ Gosub(_, _) => b.a match {
+      case Return(a) => b.f(a).resume
+      case Suspend(t) => -\/(S.map(t)(b.f))
+      case c @ Gosub(_, _) => c.a.flatMap(z => c.f(z).flatMap(b.f)).resume
+    }
   }
 
 }
 
 object Free extends FreeInstances {
   // Return from the computation with the given value.
-  case class Return[S[+_], +A](a: A) extends Free[S, A]
+  case class Return[S[+_]: Functor, +A](a: A) extends Free[S, A]
   // Suspend the computation with the given suspension.
-  case class Suspend[S[+_], +A](s: S[Free[S, A]]) extends Free[S, A]
+  case class Suspend[S[+_]: Functor, +A](s: S[Free[S, A]]) extends Free[S, A]
   // Call a subroutine and continue with the given function.
-  case class Gosub[S[+_], +A, +B](a: Free[S, A], f: A => Free[S, B]) extends Free[S, B]
+  case class Gosub[S[+_]: Functor, A, +B](a: Free[S, A], f: A => Free[S, B]) extends Free[S, B]
 
 }
 
@@ -107,7 +128,74 @@ trait FreeInstances {
     }
 }
 
+// Let's re-implement CharToy commands based on Free.
 
+object FreeCharToy {
+  sealed trait CharToy[+Next]
+  case class CharOutput[Next](a: Char, next: Next) extends CharToy[Next]
+  case class CharBell[Next](next: Next) extends CharToy[Next]
+  case class CharDone() extends CharToy[Nothing]
+
+  implicit val charToyFunctor: Functor[CharToy] = new Functor[CharToy] {
+    override def map[A, B](fa: CharToy[A])(f: A => B): CharToy[B] =
+      fa match {
+        case CharOutput(a, n) => CharOutput(a, f(n))
+        case CharBell(n) => CharBell(f(n))
+        case cd @ CharDone() => cd
+      }
+  }
+
+  def output[Next](a: Char): Free[CharToy, Unit] =
+    Free.Suspend[CharToy, Unit](CharOutput(a, Free.Return[CharToy, Unit]()))
+
+  def bell[Next]: Free[CharToy, Unit] =
+    Free.Suspend[CharToy, Unit](CharBell(Free.Return[CharToy, Unit]()))
+
+  def done: Free[CharToy, Unit] =
+    Free.Suspend[CharToy, Unit](CharDone())
+}
+
+// Let's add liftF refactoring, We need return equivalent, which we'll call pointed.
+
+object LiftFCharToy {
+  sealed trait CharToy[+Next]
+  case class CharOutput[Next](a: Char, next: Next) extends CharToy[Next]
+  case class CharBell[Next](next: Next) extends CharToy[Next]
+  case class CharDone() extends CharToy[Nothing]
+
+  implicit val charToyFunctor: Functor[CharToy] = new Functor[CharToy] {
+    override def map[A, B](fa: CharToy[A])(f: A => B): CharToy[B] =
+      fa match {
+        case CharOutput(a, n) => CharOutput(a, f(n))
+        case CharBell(n) => CharBell(f(n))
+        case cd @ CharDone() => cd
+      }
+  }
+
+  // Functor를 가지고 Free를 만든다.
+  // Suspend(map(cmd)(Return(_)))
+  def liftF[F[+_]: Functor, R](command: F[R]): Free[F, R] =
+    Free.Suspend[F, R](Functor[F].map(command){Free.Return[F, R]})
+
+  def output(a: Char): Free[CharToy, Unit] = liftF[CharToy, Unit](CharOutput(a, ()))
+
+  def bell: Free[CharToy, Unit] = liftF[CharToy, Unit](CharBell(()))
+
+  def done: Free[CharToy, Unit] = liftF[CharToy, Unit](CharDone())
+
+  def pointed[A](a: A): Free[CharToy, Unit] = Free.Return[CharToy, Unit](a)
+
+  def showProgram[R: Show](p: Free[CharToy, R]): String =
+    p.resume.fold({
+      case CharOutput(a, next) =>
+        "output " + Show[Char].show(a) + "\n" + showProgram(next)
+      case CharBell(next) =>
+        "bell \n" + showProgram(next)
+      case CharDone() =>
+        "done\n"
+    }, { r: R => "return " + Show[R].show(r) + "\n" })
+
+}
 
 
 
