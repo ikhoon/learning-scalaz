@@ -119,17 +119,25 @@ object Problem {
 // Trampoline의 자료 구조형에 대해서 정의해보자.
 sealed trait Trampoline[+A] {
   // final로 정의한 이유는 scala compiler가 tail call을 없애주기 때문이다.
+  /**
   @tailrec
-  final def runT: A = this match {
+  final def runT_: A = this match {
     case More(k) => k().runT
     case Done(v) => v
+  }
+ */
+
+  @tailrec
+  final def runT: A = resume match {
+    case Right(v) => v
+    case Left(k) => k().runT
   }
 
   // Trampoline에 flatMap을 구현한다.
   // f에 runT의 결과를 넘겨준다. 그리고 그 함수를 More 감싸서 그 안에서 실행되도록 한다.
   // f(runT)가 다시 runT에 의해서 실행이 된다.
   @deprecated
-  def flatMap[B](f: A => Trampoline[B]): Trampoline[B] =
+  def flatMap_[B](f: A => Trampoline[B]): Trampoline[B] =
   More[B](() => f(runT))
 
   // 그러나 trampoline data 타입의 constructor을 Trampoline의 데이터 타입에 넣는 것은 한계가 있다
@@ -139,14 +147,62 @@ sealed trait Trampoline[+A] {
 
 
   // 그리고 다음단계에 진행에 대한 고려를 분리해보자.
+  @deprecated
+  final def _resume: Either[() => Trampoline[A], A] = this match {
+    case Done(v) => Right(v)
+    case More(k) => Left(k)
+    case FlatMap(a, f) => a match {
+      case Done(v) => f(v)._resume
+      case More(k) => Left(() => FlatMap(k(), f))
+      case FlatMap(b, g) => (FlatMap(b, (x: Any) => FlatMap(g(x), f)): Trampoline[A])._resume
+    }
+  }
+
+  // resume의 FlatMap case에 대한 구현은 쉽지 않다.
+  // * Done의 경우 계속해서 실행한다.
+  // * More로 되어 있을경우 FlatMap안에서 하나의 step을 가도록 한다
+  // * FlatMap이 하위 subroutine을 가지고 있을경우(FlatMap)을 또가지고 있을경우에
+  // 즉 FlatMap(a, f) == FlatMap(FlatMap(b, g), f) 가 될때
+  // 새로운 스택을 만들지 않고 만드는 것을 유지하는것이 이문제를 푸는데 중요한 포인트이다.
+  // 트릭은 오른쪽으로 다시 관계를 형성하도록 하는것이다. 오른쪽 결합의 법칙
+  // FlatMap(b, x => FlatMap(g(x), f))
+  // Trampoline은 모나드이다. 그러므로 오른쪽 결합의 법칙이 성립해야한다.
+
+
+  // FlatMap이 왼쪽으로 치우져져 있으면 resume은 stack overflow가 날수 있다.
+  // f(v) 가 g(x)를 호출할것이고 이것은 또다른 inner call을 발생시킨다.
+
+  // 생성자(FlatMap)이 왼쪽으로 중첩연결되어 있는것을 피하기 위해서 FlatMap의 생성자를 private으로 바꿀것이다.
+  // 그리고 Trampoline에 flatMap 함수를 노출할것이다.
+  // flatMap함수는 FlatMap을 항상 오른쪽 연결로 결합을 통한 생성이 이루어 지도록 다시 작성할것이다.
+
+  def flatMap[B](f: A => Trampoline[B]): Trampoline[B] =
+    this match {
+      case FlatMap(b, g) => FlatMap(b, (x: Any) => g(x) flatMap f)
+      case x => FlatMap(x, f)
+    }
+
+  // 그리고 resume에서도 FlatMap 생성자를 호출하는것을 flatMap 함수를 호출하는 것으로 치환할것이다.
   final def resume: Either[() => Trampoline[A], A] = this match {
     case Done(v) => Right(v)
     case More(k) => Left(k)
     case FlatMap(a, f) => a match {
       case Done(v) => f(v).resume
-      case More(k) =>
+      case More(k) => Left(() => FlatMap(k(), f))
+      case FlatMap(b, g) => b.flatMap((x: Any) => g(x).flatMap(f)).resume
     }
   }
+
+
+  // 마지막으로 Trampoline을 monad로 scala for comprehesion에서 사용하기 위해서 map을 구현해보자
+  // flatMap을 이용해서 구현하면 된다.
+  // Done이 constructor이다.
+
+  def map[B](f: A => B): Trampoline[B] =
+    flatMap(a => Done(f(a)))
+
+
+
 }
 
 // flatMap을 case class로 표현해보자.
