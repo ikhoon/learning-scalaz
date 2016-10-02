@@ -183,6 +183,7 @@ sealed trait Trampoline[+A] {
     }
 
   // 그리고 resume에서도 FlatMap 생성자를 호출하는것을 flatMap 함수를 호출하는 것으로 치환할것이다.
+  @tailrec
   final def resume: Either[() => Trampoline[A], A] = this match {
     case Done(v) => Right(v)
     case More(k) => Left(k)
@@ -201,6 +202,21 @@ sealed trait Trampoline[+A] {
   def map[B](f: A => B): Trampoline[B] =
     flatMap(a => Done(f(a)))
 
+  // 협동하는? 멀티테스킹
+  // Trampoline은 flatMap에 의해서 순차적으로 진행된다.
+  // 하지만 간격을 둔 연산을 통해서 병렬로 합성이 또한 가능하다.
+  // this과 b를 동시에 연산하다. interleaving
+  def zip[B](tb: Trampoline[B]): Trampoline[(A, B)] =
+    (this.resume, tb.resume) match {
+      case (Right(a), Right(b)) => Done((a, b))
+      case (Left(a), Left(b)) => More(() => a() zip b())
+      case (Left(a), Right(b)) => More(() => a() zip Done(b))
+      case (Right(a), Left(b)) => More(() => Done(a) zip b())
+    }
+
+  // Trampoline은 Function0에 suspend되어 있고 나중에 resume이 되는 coroutine이라 생각할수 있다.
+  // Coroutine은 https://en.wikipedia.org/wiki/Coroutine 여길 참고해서 보면됨.
+  // 끝으로 가서 다시 Free monads : A generalize of Trampoline에 대해서 알아보자.
 
 
 }
@@ -266,7 +282,133 @@ object Trampoline {
 
 }
 
+object StacklessScala {
+  // 이젠 어떤 프로그램이든 stackless로 구현할수 있다.
+  def f() = 1
+  def g(x: Int) = x + 10
+  def h(y: Int) = y * 100
 
+  val x = f()
+  val y = g(x)
+  h(y)
+
+  // 위의 코드는 for comprehesion을 이용하여 다시 쓰여질수 있다.
+  val w: Trampoline[Int] = for {
+    x <- f()
+    y <- g(x)
+    z <- h(y)
+  } yield z
+
+  //  아래의 implicit 정의가 있다면 가능하다.
+  implicit def step[A](a: => A): Trampoline[A] =
+    More(() => Done(a))
+
+  // 결과값 w는 trampoline 이다.
+  // step의 사용이 되지 않는 케이스는 오직 자기 재귀호출에서 이다.
+  // 이런경우는 찾기 쉽고 그런 경우에는 More 생성자를 를 명시적으로 호출하면 된다.
+
+  def fib(n: Int): Trampoline[Int] =
+    if(n <= 1) Done(1)
+    else for {
+      x <- More(() => fib(n - 1))
+      y <- More(() => fib(n - 2))
+    } yield x + y
+
+  // 이런 변환은 철저히 기계적이다.
+  // compiler plugin을 만들거나 scala compiler가 이것을 변환시키는것을 생각 볼수 있다.
+  // 그럴듯하다.
+
+
+}
+
+
+// Free Monads: A generalization of Trampoline
+// Trampoline은 Function0에 suspend되어 있고 나중에 resume이 되는 coroutine이라 생각할수 있다.
+// 이것은 type 생성자 뿐만 아니라 suspension(지연)에도 사용할수 있다.
+// type 생성자를 추상화 해보자.
+
+object free {
+  sealed trait Free[S[+_], +A]{
+    private case class FlatMap[S[+_], A, +B](
+       a: Free[S, A],
+       f: A => Free[S, B]
+    ) extends Free[S, B]
+
+
+    def flatMap[B](f: A => Free[S, B]): Free[S, B] =
+      this match {
+        case FlatMap(b, g) => FlatMap(b, (x: Any) => g(x) flatMap f)
+        case x => FlatMap(x, f)
+      }
+
+    final def resume(implicit S: Functor[S]): Either[S[Free[S, A]], A] =
+      this match {
+        case Done(a) => Right(a)
+        case More(k) => Left(k)
+        // FlatMap(a, f) 와 같다. trait만 되는 줄 알았는데 case class도 되네
+        case a FlatMap f => a match {
+          case Done(v) => f(v).resume
+          case More(k) => Left(S.map(k)(_ flatMap f))
+          case b FlatMap g => b.flatMap((x: Any) => g(x) flatMap f).resume
+        }
+      }
+
+    // 위의 resume 코드는 Trampoline의 코드와 동일 하다. 바뀐점은 type signature만 바뀌었다.
+
+    def map[B](f: A => B): Free[S, B] =
+      flatMap(x => Done(f(x)))
+
+    /**
+    def zip[B](tb: Trampoline[B]): Trampoline[(A, B)] =
+      (this.resume, tb.resume) match {
+        case (Right(a), Right(b)) => Done((a, b))
+        case (Left(a), Left(b)) => More(() => a() zip b())
+        case (Left(a), Right(b)) => More(() => a() zip Done(b))
+        case (Right(a), Left(b)) => More(() => Done(a) zip b())
+      }
+      */
+    def zip[B](fb: Free[S, B])(implicit S: Functor[S]): Free[S, (A, B)] = {
+      (this.resume, fb.resume) match {
+        case (Left(a), Left(b)) =>
+          More[S, (A, B)](S.map(a)(x =>
+          More[S, (A, B)](S.map(b)(y => x zip y))))
+        case (Left(a), Right(b)) =>
+          More[S, (A, B)](S.map(a)(x => x zip Done(b)))
+        case (Right(a), Left(b)) =>
+          More[S, (A, B)](S.map(b)(y => Done(a) zip y))
+        case (Right(a), Right(b)) =>
+          Done((a, b))
+      }
+
+    }
+  }
+
+  case class Done[S[+_], +A](a: A) extends Free[S, A]
+
+  case class More[S[+_], +A](k: S[Free[S, A]]) extends Free[S, A]
+
+  // 이제 trampoline은 단순히 Function0로 표현될수 있다.
+  type Trampoline[A] = Free[Function0, A]
+  // 와우! 어렵지만 신기 방기
+
+  // 앞에서 나온 Done과 FlatMap 생성자가 증명하듯이
+  // 어떤 covariant functor S에 대해서 Free[S, A]은 모나드이다. (point와 flatMap을 가지고 있으면 모나드니께)
+
+  // 카테고적으로 보면 정확하게 free monad는 functor로 부터 생성된다.
+
+  // S가 functor라는 것은 엄밀히 말하면 Functor[S]의 instance가 반드시 존재해야 하는 것이다.
+
+  trait Functor[F[_]] {
+    def map[A, B](a: F[A])(f: A => B): F[B]
+  }
+
+  // Function0의 Functor instance이다.
+  implicit val f0Functor = new Functor[Function0] {
+    def map[A, B](a: () => A)(f: A => B): () => B = () => f(a())
+  }
+
+
+}
 
 
 
